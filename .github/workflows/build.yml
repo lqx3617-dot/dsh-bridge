@@ -1,4 +1,4 @@
-# 单文件版：GitHub 上只要放这一个文件，Actions 自动写出源码并编译 deb
+# 单文件版：GitHub 上只要放这一个文件，Actions 自动装 Theos、写出源码、编译 deb
 name: build-deb
 
 on:
@@ -8,7 +8,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: theos/theos:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -272,20 +271,34 @@ jobs:
           DSH_DSHBRIDGE_PLIST_EOF
 
 
-      - name: Environment
+      - name: Install Theos
         run: |
-          echo "THEOS=$THEOS"
-          ls "$THEOS/sdks" 2>/dev/null || echo "no sdks dir"
-          which clang ldid dpkg-deb make 2>&1 || true
-          clang --version | head -2 || true
+          export CI=1
+          export THEOS=$HOME/theos
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)" || true
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          ls "$HOME/theos/sdks" || echo "没有 sdks"
+          ls "$HOME/theos/toolchain/linux/iphone/bin" 2>/dev/null | head || echo "没有 toolchain"
+
+      - name: Install ldid if missing
+        run: |
+          if ! command -v ldid >/dev/null; then
+            curl -sL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
+            sudo install -m 755 /tmp/ldid /usr/local/bin/ldid
+          fi
+          ldid -v 2>&1 | head -2 || true
 
       - name: Build
         working-directory: src
         run: |
-          make package FINALPACKAGE=1 2>&1 | tail -60
+          export PATH=$HOME/theos/bin:/usr/local/bin:$PATH
+          make package FINALPACKAGE=1 2>&1 | tail -80
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: dshbridge-deb
-          path: src/packages/*.deb
-          if-no-files-found: error
+          path: |
+            src/packages/*.deb
+            src/.theos/_/*
+          if-no-files-found: warn
