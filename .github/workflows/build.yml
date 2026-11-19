@@ -18,55 +18,57 @@ jobs:
           mkdir -p src
           cat > src/Tweak.xm <<'DSH_TWEAK_XM_EOF'
           // DSH Bridge — SpringBoard tweak
-          // 目的：在本机 127.0.0.1 上开一个极小的 HTTP 服务，暴露三个接口：
-          //   GET  /ping            → 活着吗、系统版本、屏幕尺寸
-          //   GET  /screen          → 截屏，返回 base64 PNG
-          //   GET  /tap?x=..&y=..   → 注入一次点击
-          //   GET  /swipe?x1=&y1=&x2=&y2=&ms=  → 注入一次滑动
+          // 在本机 127.0.0.1:8484 上开一个极小的 HTTP 服务：
+          //   GET /ping            活着吗、系统版本、屏幕尺寸
+          //   GET /screen          截屏，base64 PNG
+          //   GET /tap?x=&y=       注入一次点击
+          //   GET /swipe?x1=&y1=&x2=&y2=&ms=  注入一次滑动
           //
-          // 只监听 127.0.0.1，不对外网开放。
-          // 第一版故意写得小：出问题容易定位，改一行就能重编译。
+          // 只监听 127.0.0.1。第一版故意写小：出问题容易定位。
 
           #import <UIKit/UIKit.h>
-          #import <IOKit/hid/IOHIDEventSystemClient.h>
-          #import <IOKit/hid/IOHIDEventTypes.h>
+          #import <Foundation/Foundation.h>
+          #import <mach/mach_time.h>
+          #import <pthread.h>
+          #import <errno.h>
+          #import <string.h>
+          #import <unistd.h>
           #import <sys/socket.h>
           #import <netinet/in.h>
           #import <arpa/inet.h>
-          #import <unistd.h>
+          #import <IOKit/hid/IOHIDEventSystemClient.h>
+          #import <IOKit/hid/IOHIDEvent.h>
+          #import <IOKit/hid/IOHIDEventTypes.h>
 
           #define BRIDGE_PORT 8484
 
-          // ---------- 私有 API 声明 ----------
           extern UIImage *_UICreateScreenUIImage(void);
-
-          typedef struct __IOHIDEvent *IOHIDEventRef;
-          typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
-
-          extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
-              CFAllocatorRef allocator, AbsoluteTime timeStamp, uint32_t index, uint32_t identity,
-              uint32_t eventMask, CGFloat x, CGFloat y, CGFloat z, CGFloat tipPressure,
-              CGFloat twist, CGFloat range, Boolean touch, Boolean options);
-          extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, IOHIDEventField field, CFIndex value);
-          extern void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
 
           // ---------- 触摸注入 ----------
           static IOHIDEventSystemClientRef gClient = NULL;
 
           static IOHIDEventSystemClientRef hidClient(void) {
               if (!gClient) {
-                  gClient = IOHIDEventSystemClientCreateWithType(kCFAllocatorDefault, kIOHIDEventSystemClientTypeMonitor, NULL);
+                  gClient = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
               }
               return gClient;
+          }
+
+          // mach_absolute_time() 是 uint64，而 AbsoluteTime 是 UnsignedWide，得手工拆
+          static AbsoluteTime absNow(void) {
+              AbsoluteTime t;
+              uint64_t v = mach_absolute_time();
+              t.lo = (UInt32)v;
+              t.hi = (SInt32)(v >> 32);
+              return t;
           }
 
           static void sendFinger(CGFloat x, CGFloat y, BOOL down) {
               uint32_t mask = down ? (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch) : 0;
               IOHIDEventRef ev = IOHIDEventCreateDigitizerFingerEvent(
-                  kCFAllocatorDefault, mach_absolute_time(), 2, 2, mask,
+                  kCFAllocatorDefault, absNow(), 2, 2, mask,
                   x, y, 0, 0, 0, down ? 1 : 0, down, down);
               if (!ev) return;
-              IOHIDEventSetIntegerValue(ev, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
               IOHIDEventSystemClientDispatchEvent(hidClient(), ev);
               CFRelease(ev);
           }
@@ -77,7 +79,7 @@ jobs:
               sendFinger(x, y, NO);
           }
 
-          static void swipe(CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2, int ms) {
+          static void swipeAt(CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2, int ms) {
               const int steps = 20;
               sendFinger(x1, y1, YES);
               for (int i = 1; i <= steps; i++) {
@@ -118,7 +120,6 @@ jobs:
               write(fd, resp.bytes, resp.length);
           }
 
-          // 从查询串里取一个数值参数，没有就返回 fallback
           static double queryNum(NSString *query, NSString *key, double fallback) {
               NSString *pat = [NSString stringWithFormat:@"(?:^|&)%@=([-0-9.]+)", key];
               NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
@@ -177,7 +178,7 @@ jobs:
                   if (x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0) {
                       respond(fd, 400, @"{\"ok\":false,\"error\":\"need x1 y1 x2 y2\"}");
                   } else {
-                      swipe(x1, y1, x2, y2, ms);
+                      swipeAt(x1, y1, x2, y2, ms);
                       respond(fd, 200, @"{\"ok\":true}");
                   }
 
@@ -232,7 +233,6 @@ jobs:
           %end
 
           __attribute__((constructor)) static void dshbridge_init(void) {
-              // SpringBoard 的 applicationDidFinishLaunching 已经跑过时（注入重启场景）兜底
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                              dispatch_get_main_queue(), ^{ startBridge(); });
           }
@@ -280,9 +280,7 @@ jobs:
           sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2-dev libtinfo6 xz-utils
           git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
           mkdir -p "$THEOS/toolchain"
-          curl -L --fail --retry 3 --retry-delay 3 -o /tmp/tc.tar.xz https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
-          ls -l /tmp/tc.tar.xz
-          tar -xJf /tmp/tc.tar.xz -C "$THEOS/toolchain/"
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJ - -C "$THEOS/toolchain/"
           ls "$THEOS/toolchain/linux/iphone/bin" | head -20
           "$THEOS/bin/install-sdk" latest || "$THEOS/bin/install-sdk" 16.5 || true
           ls "$THEOS/sdks" || true
