@@ -284,7 +284,12 @@ jobs:
           ls -l /tmp/tc.tar.xz
           tar -xJf /tmp/tc.tar.xz -C "$THEOS/toolchain/"
           ls "$THEOS/toolchain/linux/iphone/bin" | head -20
-          "$THEOS/bin/install-sdk" latest || "$THEOS/bin/install-sdk" 16.5 || true
+          sudo apt-get install -y unzip
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          cd /tmp/sdks && git sparse-checkout set iPhoneOS16.5.sdk
+          mkdir -p "$THEOS/sdks"
+          mv /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          cd "$GITHUB_WORKSPACE"
           ls "$THEOS/sdks" || true
           if ! command -v ldid >/dev/null; then
             curl -sL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
