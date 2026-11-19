@@ -1,0 +1,302 @@
+# 单文件版：只要在 GitHub 上建这一个文件，Actions 会自己写出源码并编译出 deb
+name: build-deb
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write tweak sources
+        run: |
+          mkdir -p src
+          cat > src/Tweak.xm <<'DSH_TWEAK_XM_EOF'
+          // DSH Bridge — SpringBoard tweak
+          // 目的：在本机 127.0.0.1 上开一个极小的 HTTP 服务，暴露三个接口：
+          //   GET  /ping            → 活着吗、系统版本、屏幕尺寸
+          //   GET  /screen          → 截屏，返回 base64 PNG
+          //   GET  /tap?x=..&y=..   → 注入一次点击
+          //   GET  /swipe?x1=&y1=&x2=&y2=&ms=  → 注入一次滑动
+          //
+          // 只监听 127.0.0.1，不对外网开放。
+          // 第一版故意写得小：出问题容易定位，改一行就能重编译。
+
+          #import <UIKit/UIKit.h>
+          #import <IOKit/hid/IOHIDEventSystemClient.h>
+          #import <IOKit/hid/IOHIDEventTypes.h>
+          #import <sys/socket.h>
+          #import <netinet/in.h>
+          #import <arpa/inet.h>
+          #import <unistd.h>
+
+          #define BRIDGE_PORT 8484
+
+          // ---------- 私有 API 声明 ----------
+          extern UIImage *_UICreateScreenUIImage(void);
+
+          typedef struct __IOHIDEvent *IOHIDEventRef;
+          typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+
+          extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
+              CFAllocatorRef allocator, AbsoluteTime timeStamp, uint32_t index, uint32_t identity,
+              uint32_t eventMask, CGFloat x, CGFloat y, CGFloat z, CGFloat tipPressure,
+              CGFloat twist, CGFloat range, Boolean touch, Boolean options);
+          extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, IOHIDEventField field, CFIndex value);
+          extern void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
+
+          // ---------- 触摸注入 ----------
+          static IOHIDEventSystemClientRef gClient = NULL;
+
+          static IOHIDEventSystemClientRef hidClient(void) {
+              if (!gClient) {
+                  gClient = IOHIDEventSystemClientCreateWithType(kCFAllocatorDefault, kIOHIDEventSystemClientTypeMonitor, NULL);
+              }
+              return gClient;
+          }
+
+          static void sendFinger(CGFloat x, CGFloat y, BOOL down) {
+              uint32_t mask = down ? (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch) : 0;
+              IOHIDEventRef ev = IOHIDEventCreateDigitizerFingerEvent(
+                  kCFAllocatorDefault, mach_absolute_time(), 2, 2, mask,
+                  x, y, 0, 0, 0, down ? 1 : 0, down, down);
+              if (!ev) return;
+              IOHIDEventSetIntegerValue(ev, kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+              IOHIDEventSystemClientDispatchEvent(hidClient(), ev);
+              CFRelease(ev);
+          }
+
+          static void tapAt(CGFloat x, CGFloat y) {
+              sendFinger(x, y, YES);
+              usleep(50 * 1000);
+              sendFinger(x, y, NO);
+          }
+
+          static void swipe(CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2, int ms) {
+              const int steps = 20;
+              sendFinger(x1, y1, YES);
+              for (int i = 1; i <= steps; i++) {
+                  CGFloat t = (CGFloat)i / steps;
+                  sendFinger(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, YES);
+                  usleep((useconds_t)(ms * 1000 / steps));
+              }
+              sendFinger(x2, y2, NO);
+          }
+
+          // ---------- 截屏 ----------
+          static NSData *capturePNG(void) {
+              __block NSData *out = nil;
+              void (^grab)(void) = ^{
+                  UIImage *img = _UICreateScreenUIImage();
+                  if (img) out = UIImagePNGRepresentation(img);
+              };
+              if ([NSThread isMainThread]) grab();
+              else dispatch_sync(dispatch_get_main_queue(), grab);
+              return out;
+          }
+
+          static NSString *screenSizeJSON(void) {
+              CGSize s = [UIScreen mainScreen].bounds.size;
+              CGFloat scale = [UIScreen mainScreen].scale;
+              return [NSString stringWithFormat:@"\"w\":%.0f,\"h\":%.0f,\"scale\":%.0f",
+                      s.width, s.height, scale];
+          }
+
+          // ---------- HTTP ----------
+          static void respond(int fd, int code, NSString *json) {
+              NSData *body = [json dataUsingEncoding:NSUTF8StringEncoding];
+              NSString *head = [NSString stringWithFormat:
+                  @"HTTP/1.1 %d OK\r\nContent-Type: application/json\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+                  code, (unsigned long)body.length];
+              NSMutableData *resp = [[head dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
+              [resp appendData:body];
+              write(fd, resp.bytes, resp.length);
+          }
+
+          // 从查询串里取一个数值参数，没有就返回 fallback
+          static double queryNum(NSString *query, NSString *key, double fallback) {
+              NSString *pat = [NSString stringWithFormat:@"(?:^|&)%@=([-0-9.]+)", key];
+              NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+              NSTextCheckingResult *m = [re firstMatchInString:query options:0 range:NSMakeRange(0, query.length)];
+              if (!m) return fallback;
+              return [[query substringWithRange:[m rangeAtIndex:1]] doubleValue];
+          }
+
+          static void handleConnection(int fd) {
+              char buf[4096];
+              ssize_t n = read(fd, buf, sizeof(buf) - 1);
+              if (n <= 0) { close(fd); return; }
+              buf[n] = 0;
+
+              NSString *req = [NSString stringWithUTF8String:buf];
+              NSString *line = [[req componentsSeparatedByString:@"\r\n"] firstObject];
+              NSArray *parts = [line componentsSeparatedByString:@" "];
+              NSString *path = parts.count >= 2 ? parts[1] : @"/";
+
+              NSString *query = @"";
+              NSString *route = path;
+              NSRange q = [path rangeOfString:@"?"];
+              if (q.location != NSNotFound) {
+                  route = [path substringToIndex:q.location];
+                  query = [path substringFromIndex:q.location + 1];
+              }
+
+              if ([route isEqualToString:@"/ping"]) {
+                  UIDevice *d = [UIDevice currentDevice];
+                  respond(fd, 200, [NSString stringWithFormat:
+                      @"{\"ok\":true,\"bridge\":\"dsh\",\"version\":\"0.1.0\",\"system\":\"%@ %@\",\"model\":\"%@\",%@}",
+                      [d systemName], [d systemVersion], [d model], screenSizeJSON()]);
+
+              } else if ([route isEqualToString:@"/screen"]) {
+                  NSData *png = capturePNG();
+                  if (!png) {
+                      respond(fd, 500, @"{\"ok\":false,\"error\":\"capture failed\"}");
+                  } else {
+                      respond(fd, 200, [NSString stringWithFormat:
+                          @"{\"ok\":true,\"png\":\"%@\"}", [png base64EncodedStringWithOptions:0]]);
+                  }
+
+              } else if ([route isEqualToString:@"/tap"]) {
+                  double x = queryNum(query, @"x", -1), y = queryNum(query, @"y", -1);
+                  if (x < 0 || y < 0) {
+                      respond(fd, 400, @"{\"ok\":false,\"error\":\"need x and y\"}");
+                  } else {
+                      tapAt(x, y);
+                      respond(fd, 200, [NSString stringWithFormat:@"{\"ok\":true,\"tapped\":[%.0f,%.0f]}", x, y]);
+                  }
+
+              } else if ([route isEqualToString:@"/swipe"]) {
+                  double x1 = queryNum(query, @"x1", -1), y1 = queryNum(query, @"y1", -1);
+                  double x2 = queryNum(query, @"x2", -1), y2 = queryNum(query, @"y2", -1);
+                  int ms = (int)queryNum(query, @"ms", 400);
+                  if (x1 < 0 || y1 < 0 || x2 < 0 || y2 < 0) {
+                      respond(fd, 400, @"{\"ok\":false,\"error\":\"need x1 y1 x2 y2\"}");
+                  } else {
+                      swipe(x1, y1, x2, y2, ms);
+                      respond(fd, 200, @"{\"ok\":true}");
+                  }
+
+              } else {
+                  respond(fd, 404, @"{\"ok\":false,\"error\":\"unknown route\",\"routes\":[\"/ping\",\"/screen\",\"/tap\",\"/swipe\"]}");
+              }
+              close(fd);
+          }
+
+          static void *serveLoop(void *unused) {
+              int srv = socket(AF_INET, SOCK_STREAM, 0);
+              if (srv < 0) { NSLog(@"[dshbridge] socket failed"); return NULL; }
+              int on = 1;
+              setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
+              struct sockaddr_in addr;
+              memset(&addr, 0, sizeof(addr));
+              addr.sin_family = AF_INET;
+              addr.sin_port = htons(BRIDGE_PORT);
+              addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+              if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+                  NSLog(@"[dshbridge] bind %d failed (errno %d)", BRIDGE_PORT, errno);
+                  close(srv);
+                  return NULL;
+              }
+              listen(srv, 8);
+              NSLog(@"[dshbridge] listening on 127.0.0.1:%d", BRIDGE_PORT);
+
+              while (1) {
+                  int fd = accept(srv, NULL, NULL);
+                  if (fd < 0) continue;
+                  @autoreleasepool { handleConnection(fd); }
+              }
+              return NULL;
+          }
+
+          static void startBridge(void) {
+              static int started = 0;
+              if (started) return;
+              started = 1;
+              pthread_t th;
+              pthread_create(&th, NULL, serveLoop, NULL);
+              pthread_detach(th);
+          }
+
+          %hook SpringBoard
+          - (void)applicationDidFinishLaunching:(id)app {
+              %orig;
+              startBridge();
+          }
+          %end
+
+          __attribute__((constructor)) static void dshbridge_init(void) {
+              // SpringBoard 的 applicationDidFinishLaunching 已经跑过时（注入重启场景）兜底
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                             dispatch_get_main_queue(), ^{ startBridge(); });
+          }
+          DSH_TWEAK_XM_EOF
+
+          cat > src/Makefile <<'DSH_MAKEFILE_EOF'
+          export TARGET = iphone:clang:latest:15.0
+          export ARCHS = arm64 arm64e
+          INSTALL_TARGET_PROCESSES = SpringBoard
+
+          # 你的机器是 rootless（/var/jb 存在），所以必须是这个 scheme
+          THEOS_PACKAGE_SCHEME = rootless
+
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = dshbridge
+          dshbridge_FILES = Tweak.xm
+          dshbridge_CFLAGS = -fobjc-arc -Wno-everything
+          dshbridge_FRAMEWORKS = UIKit IOKit
+
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          DSH_MAKEFILE_EOF
+
+          cat > src/control <<'DSH_CONTROL_EOF'
+          Package: com.dsh.bridge
+          Name: DSH Bridge
+          Version: 0.1.0
+          Architecture: iphoneos-arm64
+          Description: Local HTTP bridge on 127.0.0.1:8484 (ping / screen / tap / swipe) for on-device automation
+          Maintainer: dsh
+          Author: dsh
+          Section: Tweaks
+          Depends: mobilesubstrate
+          DSH_CONTROL_EOF
+
+          cat > src/dshbridge.plist <<'DSH_DSHBRIDGE_PLIST_EOF'
+          { Filter = { Bundles = ( "com.apple.springboard" ); }; }
+          DSH_DSHBRIDGE_PLIST_EOF
+
+
+      - name: Install Theos
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          curl -sL https://github.com/theos/sdks/archive/master.zip -o /tmp/sdks.zip
+          unzip -q /tmp/sdks.zip -d /tmp
+          mkdir -p $THEOS/sdks
+          mv /tmp/sdks-master/*.sdk $THEOS/sdks/ || true
+          brew install ldid dpkg xz >/dev/null 2>&1 || true
+
+      - name: Show env
+        run: |
+          ls $HOME/theos/sdks | head
+          ldid -v 2>&1 | head -2 || true
+          dpkg-deb --version | head -1 || true
+
+      - name: Build package
+        run: |
+          export THEOS=$HOME/theos
+          export PATH=$THEOS/bin:$PATH
+          cd src
+          make package FINALPACKAGE=1 2>&1 | tail -50
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: dshbridge-deb
+          path: src/packages/*.deb
+          if-no-files-found: error
