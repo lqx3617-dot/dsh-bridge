@@ -1,4 +1,4 @@
-# 单文件版：只要在 GitHub 上建这一个文件，Actions 会自己写出源码并编译出 deb
+# 单文件版：GitHub 上只要放这一个文件，Actions 自动写出源码并编译 deb
 name: build-deb
 
 on:
@@ -7,7 +7,8 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: ubuntu-latest
+    container: theos/theos:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -271,31 +272,19 @@ jobs:
           DSH_DSHBRIDGE_PLIST_EOF
 
 
-      - name: Install Theos
+      - name: Environment
         run: |
-          export THEOS=$HOME/theos
-          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
-          curl -sL https://github.com/theos/sdks/archive/master.zip -o /tmp/sdks.zip
-          unzip -q /tmp/sdks.zip -d /tmp
-          mkdir -p $THEOS/sdks
-          mv /tmp/sdks-master/*.sdk $THEOS/sdks/ || true
-          brew install ldid dpkg xz >/dev/null 2>&1 || true
+          echo "THEOS=$THEOS"
+          ls "$THEOS/sdks" 2>/dev/null || echo "no sdks dir"
+          which clang ldid dpkg-deb make 2>&1 || true
+          clang --version | head -2 || true
 
-      - name: Show env
+      - name: Build
+        working-directory: src
         run: |
-          ls $HOME/theos/sdks | head
-          ldid -v 2>&1 | head -2 || true
-          dpkg-deb --version | head -1 || true
+          make package FINALPACKAGE=1 2>&1 | tail -60
 
-      - name: Build package
-        run: |
-          export THEOS=$HOME/theos
-          export PATH=$THEOS/bin:$PATH
-          cd src
-          make package FINALPACKAGE=1 2>&1 | tail -50
-
-      - name: Upload deb
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: dshbridge-deb
           path: src/packages/*.deb
