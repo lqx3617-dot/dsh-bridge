@@ -42,11 +42,20 @@ jobs:
 
           #define BRIDGE_PORT 8484
 
+          // 这个文件按 ObjC++ 编译，私有符号必须显式 C 链接，否则会被改名（__Z22...）
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
           extern UIImage *_UICreateScreenUIImage(void);
 
           // Theos 自带的 IOKit 头只暴露了公开子集，这两个得自己声明
           extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
           extern void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
+
+          #ifdef __cplusplus
+          }
+          #endif
 
           // ---------- 触摸注入 ----------
           static IOHIDEventSystemClientRef gClient = NULL;
