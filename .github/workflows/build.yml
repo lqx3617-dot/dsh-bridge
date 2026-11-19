@@ -1,4 +1,4 @@
-# 单文件版：GitHub 上只要放这一个文件，Actions 自动装 Theos、写出源码、编译 deb
+# 单文件版：GitHub 上只要放这一个文件，Actions 自动装 Theos 工具链、写出源码、编译 deb
 name: build-deb
 
 on:
@@ -8,6 +8,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
     steps:
       - uses: actions/checkout@v4
 
@@ -271,17 +273,17 @@ jobs:
           DSH_DSHBRIDGE_PLIST_EOF
 
 
-      - name: Install Theos
+      - name: Install Theos toolchain and SDK
         run: |
-          export CI=1
-          export THEOS=$HOME/theos
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)" || true
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          ls "$HOME/theos/sdks" || echo "没有 sdks"
-          ls "$HOME/theos/toolchain/linux/iphone/bin" 2>/dev/null | head || echo "没有 toolchain"
-
-      - name: Install ldid if missing
-        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2-dev libtinfo6 xz-utils
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain"
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz | tar -xJ - -C "$THEOS/toolchain/"
+          ls "$THEOS/toolchain/linux/iphone/bin" | head -20
+          "$THEOS/bin/install-sdk" latest || "$THEOS/bin/install-sdk" 16.5 || true
+          ls "$THEOS/sdks" || true
           if ! command -v ldid >/dev/null; then
             curl -sL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/latest/download/ldid_linux_x86_64
             sudo install -m 755 /tmp/ldid /usr/local/bin/ldid
@@ -291,8 +293,9 @@ jobs:
       - name: Build
         working-directory: src
         run: |
-          export PATH=$HOME/theos/bin:/usr/local/bin:$PATH
-          make package FINALPACKAGE=1 2>&1 | tail -80
+          set -euxo pipefail
+          export PATH="$THEOS/toolchain/linux/iphone/bin:/usr/local/bin:$PATH"
+          make package FINALPACKAGE=1 2>&1 | tail -100
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -300,5 +303,5 @@ jobs:
           name: dshbridge-deb
           path: |
             src/packages/*.deb
-            src/.theos/_/*
+            src/.theos/_/**/*
           if-no-files-found: warn
